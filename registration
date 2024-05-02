@@ -1,0 +1,695 @@
+using AutoMapper;
+using Microsoft.Crm.Sdk.Messages;
+using Microsoft.Xrm.Sdk;
+using Microsoft.Xrm.Sdk.Query;
+using Newtonsoft.Json;
+using NServiceBus.Logging;
+using System;
+using System.Configuration;
+using System.IO;
+using System.Linq;
+using System.ServiceModel;
+using TheFA.CoreServices.ViewModels.Account;
+using TheFA.Integration.Messages;
+using TheFA.Integration.Onside.Services;
+using TheFA.Integration.WGSService.Common;
+using TheFA.WGS.Xrm;
+using TheFA.WGS.Xrm.OptionSets;
+
+namespace Migration
+{
+    [Migrator(nameof(Registration))]
+    public class Registration : IMigrate
+    {
+        private static ILog _log = LogManager.GetLogger(typeof(Registration));
+        private readonly ILookup _lookup;
+        private readonly IMapper _mapper;
+        private readonly IWGSService _wgsService;
+        private readonly IIndividualService _individualService;
+
+        public Registration(IWGSService wgsService, ILookup lookup, IMapper mapper, IIndividualService individualService)
+        {
+            _wgsService = wgsService;
+            _lookup = lookup;
+            _mapper = mapper;
+            _individualService = individualService;
+        }
+
+        private void ReadIndividualFromOnsideAndAddToWGS(int fan)
+        {
+            var entity = _individualService.GetByFAN(fan, out _);
+            if (entity == null)
+            {
+                _log.Error($"Registration ReadIndividual failed to read entity. FAN={fan}");
+                throw new FaIntegrationException($"Registration ReadIndividual failed to read entity. FAN={fan}");
+            }
+
+            try
+            {
+                var individual = _mapper.Map<IndividualFullSummaryDto, Contact>(entity);
+                // Check not come across since check
+                var individualEntityReference = _lookup.EntityReference("contact", "fa_fanid", fan.ToString());
+                if (individualEntityReference == null || individualEntityReference.Id == Guid.Empty)
+                {
+                    _wgsService.Create(individual);
+                }
+            }
+            catch (Exception e)
+            {
+                _log.Error($"Registration ReadIndividual failed to map entity. FAN={fan}, Exception={e}");
+                throw new FaIntegrationException($"Registration ReadIndividual failed to map entity. FAN={fan}, Exception={e}", e);
+            }
+        }
+
+        public void Do()
+        {
+            var fileIds = ConfigurationManager.AppSettings["FileIds"];
+
+            var lines = File.ReadAllLines(fileIds);
+
+            _log.Info($"Ids count:{lines.Count()}");
+
+            var settings = new JsonSerializerSettings
+            {
+                NullValueHandling = NullValueHandling.Ignore
+            };
+            
+            foreach (var line in lines)
+            {
+                var message = new TeamPlayerRegistration();
+                dynamic registration;
+
+                try
+                {
+                    registration = Newtonsoft.Json.JsonConvert.DeserializeObject<dynamic>(line, settings);
+                }
+                catch (Exception je)
+                {
+                    _log.Error($"Registration: failed on JSONConvert, line = {line}, exception={je}");
+                    continue;
+                }
+
+                message.FAN = registration["FAN"];
+                message.ExpiryDate = registration["ExpiryDate"];
+                message.IsActive = registration["IsActive"];
+                message.LeagueName = registration["LeagueName"];
+                message.LeagueOnsideOrganisationId = registration["LeagueOnsideOrganisationId"];
+                message.LeagueWGSAccountId = registration["LeagueWGSAccountId"];
+                message.PFFTeamPlayerId = registration["PFFTeamPlayerId"];
+                message.RegistrationNumber = registration["RegistrationNumber"];
+                message.RegistrationStatus = registration["RegistrationStatus"];
+                message.Season = registration["Season"];
+                message.StartDate = registration["StartDate"];
+                message.TeamWGSAccountId = registration["TeamWGSAccountId"];
+                message.PffTeamId = registration["PffTeamId"];
+                message.TimeStamp = DateTime.Now;
+
+                _log.Info($"Registration: message = {message}");
+
+                try
+                {
+                    if (string.IsNullOrEmpty(message.RegistrationNumber))
+                    {
+                        throw new FaIntegrationException($"Registration: failed, registration number not set message = {message}");
+                    }
+
+                    if (!message.IsActive && message.RegistrationStatus == TheFA.Integration.Messages.Constants.PlayerRegistrationStatusPending && !message.StartDate.HasValue)
+                    {
+                        _log.Info($"Registration: IGNORE as pending registration with no start date message = {message}");
+                        continue;
+                    }
+
+                    if (ConfigurationManager.AppSettings["skipPendingRegistrations"] != null && message.RegistrationStatus == TheFA.Integration.Messages.Constants.PlayerRegistrationStatusPending)
+                    {
+                        _log.Info($"Registration: IGNORE as skipping pending registrations message = {message}");
+                        continue;
+                    }
+
+                    // Check if have individual in WGS
+                    var individualEntityReference = _lookup.EntityReference("contact", "fa_fanid", message.FAN.ToString());
+                    if (individualEntityReference == null || individualEntityReference.Id == Guid.Empty)
+                    {
+                        _log.Info($"Registration: ReadLeaguePlayer player not found = {message}");
+
+                        ReadIndividualFromOnsideAndAddToWGS(message.FAN);
+                    }
+
+                    // Need to check for existing registration, club-player and team-player memberships
+                    LeaguePlayer(message);
+                    TeamPlayer(message);
+
+                    _log.Info($"Registration: processed message = {message}");
+                }
+                catch (Exception e)
+                {
+                    _log.Error($"Registration: failed, message = {message}, exception={e}");
+                }
+
+            }
+        }
+
+        private void LeaguePlayer(TeamPlayerRegistration message)
+        {
+            _log.Info($"TeamPlayerRegistrationMessageReceiveHandler: leagueplayer message = {message}");
+
+            if (!message.LeagueWGSAccountId.HasValue && !message.LeagueOnsideOrganisationId.HasValue)
+            {
+                // Check if withdrawing previous registration request
+                var leaguePlayerRegistrationWithdrawn = ReadLeaguePlayerByPFFId(message);
+
+                if (leaguePlayerRegistrationWithdrawn != null)
+                {
+                    _log.Info($"TeamPlayerRegistrationMessageReceiveHandler: leagueplayer message = {message} previous registration WITHDRAWN");
+
+                    // Deactivate the membership
+                    var setState = new SetStateRequest
+                    {
+                        State = new OptionSetValue(1),
+                        Status = new OptionSetValue(2),
+                        EntityMoniker = new EntityReference(leaguePlayerRegistrationWithdrawn.LogicalName, leaguePlayerRegistrationWithdrawn.Id)
+                    };
+
+                    _wgsService.Execute(setState);
+                }
+                else
+                {
+                    _log.Info($"TeamPlayerRegistrationMessageReceiveHandler: leagueplayer message = {message} NO LEAGUE SPECIFIED IGNORED");
+                }
+                return;
+            }
+
+            Sb_membership leaguePlayerRegistration = ReadLeaguePlayer(message);
+            Guid entityId;
+
+            // Optimisation - if enabled we skip creating pending league-player registration in WGS
+            if (leaguePlayerRegistration == null && ConfigurationManager.AppSettings["skipPendingRegistrations"] != null && message.RegistrationStatus == TheFA.Integration.Messages.Constants.PlayerRegistrationStatusPending)
+            {
+                _log.Info($"TeamPlayerRegistrationMessageReceiveHandler: IGNORE LeaguePlayer as skipping pending registrations message = {message}");
+                return;
+            }
+
+            var entityReferenceFAN = _lookup.EntityReference("contact", "fa_fanid", message.FAN.ToString());
+
+            try
+            {
+                var makePending = false;
+
+                if (leaguePlayerRegistration != null)
+                {
+                    _log.Info($"TeamPlayerRegistrationMessageReceiveHandler: read existing league player, message = {message}, leaguePlayerRegistration.StateCode={leaguePlayerRegistration.statecode}");
+
+                    // Check for a re-sent approved message to see if anything has changed, e.g. start date, team etc.
+                    if ((message.RegistrationStatus == TheFA.Integration.Messages.Constants.PlayerRegistrationStatusApproved ||
+                        message.RegistrationStatus == TheFA.Integration.Messages.Constants.PlayerRegistrationStatusRegistered) &&
+                        leaguePlayerRegistration.fa_status_playerleagueregistration == (int)fa_playerregistrationstatus.Approved)
+                    {
+                        if (message.IsActive && leaguePlayerRegistration.statecode == 1)
+                        {
+                            _log.Info($"TeamPlayerRegistrationMessageReceiveHandler: registration approved but WGS inactive, message = {message}");
+                            MakeActiveAndReRead(leaguePlayerRegistration);
+                        }
+
+                        if (message.LeagueWGSAccountId.HasValue && leaguePlayerRegistration.sb_IssuingOrganisationId.Id != message.LeagueWGSAccountId)
+                        {
+                            _log.Info($"Registration: registration already approved but for different LEAGUE, message = {message}");
+                            // Have to set approved back to pending to make changes
+                            makePending = true;
+                        }
+                        else if (message.TeamWGSAccountId.HasValue && leaguePlayerRegistration.fa_PlayerRegistrationTeamId.Id != message.TeamWGSAccountId)
+                        {
+                            _log.Info($"Registration: registration already approved but for different TEAM, message = {message}");
+                            // Have to set approved back to pending to make changes
+                            makePending = true;
+                        }
+                        else if (message.StartDate.HasValue && message.StartDate.Value != leaguePlayerRegistration.Sb_StartDate.Value)
+                        {
+                            _log.Info($"TeamPlayerRegistrationMessageReceiveHandler: registration approved but WGS has different start date, message = {message}");
+                            // Have to set approved back to pending to make changes
+                            makePending = true;
+                        }
+                        else if (message.ExpiryDate.HasValue && message.ExpiryDate.Value != leaguePlayerRegistration.Sb_ExpiryDate.Value)
+                        {
+                            _log.Info($"TeamPlayerRegistrationMessageReceiveHandler: registration approved but WGS has different expiry date, message = {message}");
+                            // Have to set approved back to pending to make changes
+                            makePending = true;
+                        }
+                        else if (entityReferenceFAN.Id != leaguePlayerRegistration.sb_contactid.Id) // Switching FAN
+                        {
+                            _log.Info($"TeamPlayerRegistrationMessageReceiveHandler: registration approved but WGS has different FAN, message = {message}");
+                            // Have to set approved back to pending to make changes
+                            makePending = true;
+                        }
+                        else
+                        {
+                            _log.Info($"TeamPlayerRegistrationMessageReceiveHandler: registration already approved, message = {message}");
+                            return;
+                        }
+                    }
+                    else if (message.RegistrationStatus == TheFA.Integration.Messages.Constants.PlayerRegistrationStatusPending &&
+                        leaguePlayerRegistration.fa_status_playerleagueregistration != (int)fa_playerregistrationstatus.Pending) // Going back to pending from another state - don't allow as could be a message retry after another message has been processed
+                    {
+                        _log.Info($"TeamPlayerRegistrationMessageReceiveHandler: registration pending but WGS not pending IGNORE, message = {message}");
+                        return;
+                    }
+                    else if (entityReferenceFAN.Id != leaguePlayerRegistration.sb_contactid.Id) // Switching FAN
+                    {
+                        _log.Info($"TeamPlayerRegistrationMessageReceiveHandler: registration approved but WGS has different FAN, message = {message}");
+                        // Have to set approved back to pending to make changes
+                        makePending = true;
+                    }
+                    else if (message.RegistrationStatus != TheFA.Integration.Messages.Constants.PlayerRegistrationStatusPending) // Message is not pending and WGS is not approved 
+                    {
+                        _log.Info($"TeamPlayerRegistrationMessageReceiveHandler: registration not pending and WGS not approved, message = {message}");
+                        makePending = true;
+                    }
+
+                    if (makePending)
+                    {
+                        MakePendingAndReRead(leaguePlayerRegistration);
+                    }
+
+                    leaguePlayerRegistration = _mapper.Map<TeamPlayerRegistration, Sb_membership>(message, leaguePlayerRegistration, opt => opt.Items["MembershipProductType"] = Constants.ProductLeaguePlayerRegistration);
+                    leaguePlayerRegistration.EntityState = EntityState.Changed;
+                    _wgsService.Update(leaguePlayerRegistration);
+
+                    entityId = leaguePlayerRegistration.Id;
+                }
+                else
+                {
+                    _log.Info($"TeamPlayerRegistrationMessageReceiveHandler: creating league player, message = {message}");
+
+                    leaguePlayerRegistration = _mapper.Map<TeamPlayerRegistration, Sb_membership>(message, opt => opt.Items["MembershipProductType"] = Constants.ProductLeaguePlayerRegistration);
+                    entityId = _wgsService.Create(leaguePlayerRegistration);
+                }
+
+                // Set the status of the membership
+                var setState = new SetStateRequest
+                {
+                    State = message.IsActive ? new OptionSetValue(0) : new OptionSetValue(1),
+                    Status = message.IsActive ? new OptionSetValue(1) : new OptionSetValue(2),
+                    EntityMoniker = new EntityReference(leaguePlayerRegistration.LogicalName, entityId)
+                };
+
+                _wgsService.Execute(setState);
+            }
+            catch (Exception e)
+            {
+                var organizationServiceFault = e as FaultException<OrganizationServiceFault>;
+                var crmMessage = "NA";
+
+                // Depending on which crm action caused an exception, the organizationservicefault might be found in a different place
+                if (organizationServiceFault == null && e is SaveChangesException saveChanges && saveChanges.Results.Count > 0)
+                {
+                    organizationServiceFault = saveChanges.Results[0].Error as FaultException<OrganizationServiceFault>;
+                }
+
+                if (organizationServiceFault != null && organizationServiceFault.Detail != null)
+                {
+                    crmMessage = !string.IsNullOrEmpty(organizationServiceFault.Detail.TraceText) ? organizationServiceFault.Detail.TraceText : "N/A";
+                }
+
+                if (crmMessage.Contains("Check Player Registration Membership. One Membership To One Player Per Season"))
+                {
+                    _log.Error($"Registration failed in league player due to DUPLICATE, exception={e}, crmMessage={crmMessage}");
+
+                    /*
+                    using (var contextWGS = new WGSServiceContext(_wgsService))
+                    {
+                        var individual = contextWGS.ContactSet.FirstOrDefault(c => c.fa_FanID == message.FAN && c.StateCode == 0);
+
+                        // Find other membership and deactivate it
+                        var registrationProduct = contextWGS.ProductSet.FirstOrDefault(p => p.fa_ProductToken == Constants.ProductLeaguePlayerRegistration);
+
+                        // Look for match by league, team and current season
+                        var league = ReadLeague(message);
+                        var team = ReadTeam(message);
+                        var season = _lookup.FindCurrentSeason();
+                        var pffid = message.PFFTeamPlayerId.ToString();
+
+                        // Look for active pending league-player
+                        leaguePlayerRegistration = contextWGS.Sb_membershipSet.FirstOrDefault(m => m.sb_contactid.Id == individual.Id &&
+                            m.sb_IssuingOrganisationId.Id == league.Id &&
+                            m.fa_PlayerRegistrationTeamId.Id == team.Id &&
+                            m.sb_productid.Id == registrationProduct.Id &&
+                            m.fa_SeasonId.Id == season.Id &&
+                            m.fa_pffmembershipno != pffid &&
+                            m.fa_status_playerleagueregistration == (int)fa_playerregistrationstatus.Pending &&
+                            m.statecode == 0);
+
+                        if (leaguePlayerRegistration != null)
+                        {
+                            _log.Info("Found other pending registration");
+
+                            var setState = new SetStateRequest
+                            {
+                                State = new OptionSetValue(1),
+                                Status = new OptionSetValue(2),
+                                EntityMoniker = new EntityReference(leaguePlayerRegistration.LogicalName, leaguePlayerRegistration.Id)
+                            };
+
+                            _wgsService.Execute(setState);
+
+                            LeaguePlayer(message);
+                        }
+                    }
+                    */
+                }
+                else
+                {
+                    _log.Error($"TeamPlayerRegistrationMessageReceiveHandler failed in league player, exception={e}, crmMessage={crmMessage}");
+                    throw;
+                }
+            }
+        }
+
+        private void MakeActiveAndReRead(Sb_membership leaguePlayerRegistration)
+        {
+            var setStateReactive = new SetStateRequest
+            {
+                State = new OptionSetValue(0),
+                Status = new OptionSetValue(1),
+                EntityMoniker = new EntityReference(leaguePlayerRegistration.LogicalName, leaguePlayerRegistration.Id)
+            };
+            _wgsService.Execute(setStateReactive);
+        }
+
+        private void MakePendingAndReRead(Sb_membership leaguePlayerRegistration)
+        {
+            leaguePlayerRegistration.fa_status_playerleagueregistration = (int)fa_playerregistrationstatus.Pending;
+            leaguePlayerRegistration.EntityState = EntityState.Changed;
+            leaguePlayerRegistration.statuscode = (int)sb_membership_statuscode.Active;
+            _wgsService.Update(leaguePlayerRegistration);
+        }
+
+        private void TeamPlayer(TeamPlayerRegistration message)
+        {
+            _log.Info($"TeamPlayerRegistrationMessageReceiveHandler: teamplayer message = {message}");
+
+            Sb_membership teamPlayerMembership;
+            Product teamPlayerProduct;
+            Guid entityId;
+
+            try
+            {
+                var entityReference = _lookup.EntityReference("contact", "fa_fanid", message.FAN.ToString());
+
+                EntityReference teamEntityReference = null;
+                Account team = null;
+                if (message.TeamWGSAccountId.HasValue)
+                {
+                    team = (Account)_wgsService.Retrieve(Account.EntityLogicalName, message.TeamWGSAccountId.Value, new ColumnSet("fa_onsideorganisationid", "parentaccountid", "sb_businessorganisationid"));
+                    teamEntityReference = new EntityReference(Account.EntityLogicalName, team.Id);
+                }
+                else if (message.PffTeamId.HasValue)
+                {
+                    using (var contextWGS = new WGSServiceContext(_wgsService))
+                    {
+                        team = contextWGS.AccountSet.FirstOrDefault(c => c.fa_PffId == message.PffTeamId.Value && c.fa_AccountType == (int)fa_accounttype.Team);
+                    }
+                }
+                else if (message.TeamOnsideOrganisationId.HasValue)
+                {
+                    teamEntityReference = _lookup.EntityReference(Account.EntityLogicalName, "fa_onsideorganisationid", message.TeamOnsideOrganisationId.Value.ToString());
+                    if (teamEntityReference == null || teamEntityReference.Id == Guid.Empty)
+                    {
+                        throw new FaIntegrationException($"TeamPlayerRegistrationToSbMembership: failed, no team found in WGS, message={message}");
+                    }
+
+                    team = (Account)_wgsService.Retrieve(Account.EntityLogicalName, teamEntityReference.Id, new ColumnSet("fa_onsideorganisationid", "parentaccountid", "sb_businessorganisationid"));
+                }
+
+                if (team == null || team.Id == Guid.Empty)
+                {
+                    throw new FaIntegrationException($"TeamPlayerRegistrationToSbMembership: failed, no team found in WGS, message={message}");
+                }
+
+                int stateCode;
+                int statusCode;
+
+                using (var contextWGS = new WGSServiceContext(_wgsService))
+                {
+                    teamPlayerProduct = contextWGS.ProductSet.FirstOrDefault(p => p.fa_ProductToken == Constants.ProductTeamPlayer);
+                    var teamPlayerMemberships = contextWGS.Sb_membershipSet.Where(m => m.sb_contactid.Id == entityReference.Id && m.sb_IssuingOrganisationId.Id == team.Id && m.sb_productid.Id == teamPlayerProduct.Id).ToList();
+
+                    if (teamPlayerMemberships.Count == 0)
+                    {
+                        _log.Info($"TeamPlayerRegistrationMessageReceiveHandler: teamplayer creating message = {message}");
+
+                        teamPlayerMembership = _mapper.Map<TeamPlayerRegistration, Sb_membership>(message, opt => opt.Items["MembershipProductType"] = Constants.ProductTeamPlayer);
+                        entityId = _wgsService.Create(teamPlayerMembership);
+
+                        if (message.IsActive)
+                        {
+                            stateCode = 0;
+                            statusCode = (int)sb_membership_statuscode.Active;
+                        }
+                        else
+                        {
+                            stateCode = 1;
+                            statusCode = (int)sb_membership_statuscode.Detached;
+                        }
+
+                        var setState = new SetStateRequest
+                        {
+                            State = new OptionSetValue(stateCode),
+                            Status = new OptionSetValue(statusCode),
+                            EntityMoniker = new EntityReference(teamPlayerMembership.LogicalName, entityId)
+                        };
+
+                        _wgsService.Execute(setState);
+                        _log.Info($"TeamPlayerRegistrationMessageReceiveHandler: teamplayer created message = {message}");
+
+                    }
+                    else
+                    {
+                        foreach (var teamPlayerMem in teamPlayerMemberships)
+                        {
+                            if (teamPlayerMem != null)
+                            {
+                                contextWGS.Detach(teamPlayerMem);
+                            }
+
+                            if (teamPlayerMem != null)
+                            {
+                                _log.Info($"TeamPlayerRegistrationMessageReceiveHandler: team player already exists = {message}");
+
+                                teamPlayerMembership = _mapper.Map<TeamPlayerRegistration, Sb_membership>(message, teamPlayerMem, opt => opt.Items["MembershipProductType"] = Constants.ProductTeamPlayer);
+                                teamPlayerMembership.EntityState = EntityState.Changed;
+                                _wgsService.Update(teamPlayerMembership);
+
+                                entityId = teamPlayerMembership.Id;
+                            }
+                            else
+                            {
+                                _log.Info($"TeamPlayerRegistrationMessageReceiveHandler: teamplayer creating message = {message}");
+
+                                teamPlayerMembership = _mapper.Map<TeamPlayerRegistration, Sb_membership>(message, opt => opt.Items["MembershipProductType"] = Constants.ProductTeamPlayer);
+                                entityId = _wgsService.Create(teamPlayerMembership);
+
+                                _log.Info($"TeamPlayerRegistrationMessageReceiveHandler: teamplayer created message = {message}");
+                            }
+
+                            if (message.IsActive)
+                            {
+                                stateCode = 0;
+                                statusCode = (int)sb_membership_statuscode.Active;
+                            }
+                            else
+                            {
+                                stateCode = 1;
+                                statusCode = (int)sb_membership_statuscode.Detached;
+                            }
+
+                            var setState = new SetStateRequest
+                            {
+                                State = new OptionSetValue(stateCode),
+                                Status = new OptionSetValue(statusCode),
+                                EntityMoniker = new EntityReference(teamPlayerMembership.LogicalName, entityId)
+                            };
+
+                            _wgsService.Execute(setState);
+                        }
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                _log.Error($"TeamPlayerRegistrationMessageReceiveHandler failed in team player, exception={e}");
+                throw;
+            }
+
+            _log.Info($"TeamPlayerRegistrationMessageReceiveHandler: teamplayer message = {message} PROCESSED");
+        }
+
+        private Sb_membership ReadLeaguePlayer(TeamPlayerRegistration message)
+        {
+            Sb_membership leaguePlayerRegistration;
+
+            try
+            {
+                var entityReference = _lookup.EntityReference("contact", "fa_fanid", message.FAN.ToString());
+
+                using (var contextWGS = new WGSServiceContext(_wgsService))
+                {
+                    var registrationProduct = contextWGS.ProductSet.FirstOrDefault(p => p.fa_ProductToken == Constants.ProductLeaguePlayerRegistration);
+
+                    // Look by PFF number first
+                    leaguePlayerRegistration = contextWGS.Sb_membershipSet.FirstOrDefault(m => m.fa_pffplayerregistrationno == message.RegistrationNumber && m.sb_productid.Id == registrationProduct.Id);
+                    if (leaguePlayerRegistration == null)
+                    {
+                        // Look for match by league, team and current season
+                        var league = ReadLeague(message);
+                        var team = ReadTeam(message);
+                        var season = _lookup.FindCurrentSeason();
+
+                        var stateCode = message.IsActive ? 0 : 1;
+
+                        leaguePlayerRegistration = contextWGS.Sb_membershipSet.FirstOrDefault(m => m.sb_contactid.Id == entityReference.Id &&
+                            m.sb_IssuingOrganisationId.Id == league.Id &&
+                            m.fa_PlayerRegistrationTeamId.Id == team.Id &&
+                            m.sb_productid.Id == registrationProduct.Id &&
+                            m.fa_SeasonId.Id == season.Id &&
+                            m.statecode == stateCode);
+                    }
+
+                    if (leaguePlayerRegistration != null)
+                    {
+                        contextWGS.Detach(leaguePlayerRegistration);
+
+                        // The found registration might not be active
+                        if (message.IsActive && leaguePlayerRegistration.statuscode != (int)sb_membership_statuscode.Active)
+                        {
+                            var setStateReactive = new SetStateRequest
+                            {
+                                State = new OptionSetValue(0),
+                                Status = new OptionSetValue(1),
+                                EntityMoniker = new EntityReference(leaguePlayerRegistration.LogicalName, leaguePlayerRegistration.Id)
+                            };
+                            _wgsService.Execute(setStateReactive);
+                            leaguePlayerRegistration = ReadLeaguePlayer(message);
+                        }
+
+                        // If registration in WGS is not approved, it must be set to Pending otherwise WGS throws an error
+                        if (message.RegistrationStatus == TheFA.Integration.Messages.Constants.PlayerRegistrationStatusApproved &&
+                            leaguePlayerRegistration.fa_status_playerleagueregistration != (int)fa_playerregistrationstatus.Approved && leaguePlayerRegistration.fa_status_playerleagueregistration != (int)fa_playerregistrationstatus.Pending)
+                        {
+                            leaguePlayerRegistration.fa_status_playerleagueregistration = (int)fa_playerregistrationstatus.Pending;
+                            leaguePlayerRegistration.EntityState = EntityState.Changed;
+                            _wgsService.Update(leaguePlayerRegistration);
+
+                            leaguePlayerRegistration = ReadLeaguePlayer(message);
+                        }
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                _log.Error($"TeamPlayerRegistrationMessageReceiveHandler failed in read league player, exception={e}");
+                throw;
+            }
+            return leaguePlayerRegistration;
+        }
+
+
+        private Sb_membership ReadLeaguePlayerByPFFId(TeamPlayerRegistration message)
+        {
+            Sb_membership leaguePlayerRegistration;
+
+            try
+            {
+                var entityReference = _lookup.EntityReference("contact", "fa_fanid", message.FAN.ToString());
+
+                using (var contextWGS = new WGSServiceContext(_wgsService))
+                {
+                    var registrationProduct = contextWGS.ProductSet.FirstOrDefault(p => p.fa_ProductToken == Constants.ProductLeaguePlayerRegistration);
+
+                    // Look by PFF number first
+                    leaguePlayerRegistration = contextWGS.Sb_membershipSet.FirstOrDefault(m => m.sb_contactid.Id == entityReference.Id && m.fa_pffplayerregistrationno == message.RegistrationNumber && m.sb_productid.Id == registrationProduct.Id);
+
+                    if (leaguePlayerRegistration != null)
+                    {
+                        contextWGS.Detach(leaguePlayerRegistration);
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                _log.Error($"TeamPlayerRegistrationMessageReceiveHandler failed in read league player by PFF id, exception={e}");
+                throw;
+            }
+            return leaguePlayerRegistration;
+        }
+
+        private EntityReference ReadTeam(TeamPlayerRegistration source)
+        {
+            // Team
+            EntityReference teamEntityReference = null;
+
+            try
+            {
+                Account team = null;
+                if (source.PffTeamId.HasValue)
+                {
+                    using (var contextWGS = new WGSServiceContext(_wgsService))
+                    {
+                        team = contextWGS.AccountSet.FirstOrDefault(c => c.fa_PffId == source.PffTeamId.Value && c.fa_AccountType == (int)fa_accounttype.Team);
+                    }
+
+                    if (team == null || team.Id == Guid.Empty)
+                    {
+                        throw new FaIntegrationException($"TeamPlayerRegistrationToSbMembership: failed, no team found in WGS for PffTeamId={source.PffTeamId.Value} ");
+                    }
+
+                    teamEntityReference = new EntityReference(Account.EntityLogicalName, team.Id); 
+                }
+                else if (source.TeamWGSAccountId.HasValue)
+                {
+                    team = (Account)_wgsService.Retrieve(Account.EntityLogicalName, source.TeamWGSAccountId.Value, new ColumnSet("fa_onsideorganisationid", "parentaccountid", "sb_businessorganisationid"));
+                    teamEntityReference = new EntityReference(Account.EntityLogicalName, team.Id);
+                }
+                else if (source.TeamOnsideOrganisationId.HasValue)
+                {
+                    teamEntityReference = _lookup.EntityReference(Account.EntityLogicalName, "fa_onsideorganisationid", source.TeamOnsideOrganisationId.Value.ToString());
+                    if (teamEntityReference == null || teamEntityReference.Id == Guid.Empty)
+                    {
+                        throw new FaIntegrationException($"TeamPlayerRegistrationToSbMembership: failed, no team found in WGS, message={source}");
+                    }
+
+                    team = (Account)_wgsService.Retrieve(Account.EntityLogicalName, teamEntityReference.Id, new ColumnSet("fa_onsideorganisationid", "parentaccountid", "sb_businessorganisationid"));
+                }
+            }
+            catch (Exception e)
+            {
+                _log.Error($"TeamPlayerRegistrationMessageReceiveHandler failed in read team, exception={e}");
+                throw;
+            }
+
+            return teamEntityReference;
+        }
+
+        private EntityReference ReadLeague(TeamPlayerRegistration source)
+        {
+            EntityReference leagueEntityReference;
+
+            try
+            {
+                if (source.LeagueWGSAccountId.HasValue)
+                {
+                    var league = (Account)_wgsService.Retrieve(Account.EntityLogicalName, source.LeagueWGSAccountId.Value, new ColumnSet("fa_onsideorganisationid", "sb_businessorganisationid"));
+                    leagueEntityReference = new EntityReference(Account.EntityLogicalName, league.Id);
+                }
+                else
+                {
+                    leagueEntityReference = _lookup.EntityReference(Account.EntityLogicalName, "fa_onsideorganisationid", source.LeagueOnsideOrganisationId.Value.ToString());
+                }
+            }
+            catch (Exception e)
+            {
+                _log.Error($"TeamPlayerRegistrationMessageReceiveHandler failed in read league, exception={e}");
+                throw;
+            }
+
+            return leagueEntityReference;
+        }
+    }
+}
